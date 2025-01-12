@@ -6,121 +6,126 @@ import time
 class SpeedTestClient:
     def __init__(self, file_size=2048):
         """
-        Initializes the client.
-        :param file_size: Number of bytes to request from the server.
+        Client that:
+          - Waits for server offer on UDP port 13117
+          - Connects over TCP to request a file
+          - Receives data over TCP
+          - Also receives data over UDP to the same ephemeral port
         """
         self.file_size = file_size
         self.server_ip = None
-        self.server_port = None  # This will be discovered from broadcast
+        self.server_port = None
+
+        # For UDP listening
         self.udp_socket = None
-        self.udp_received_bytes = 0
-        self.udp_segments_received = 0
-        self.udp_listen_thread = None
         self.keep_listening = True
+        self.udp_listen_thread = None
+
+        # Stats
+        self.udp_segments_received = 0
+        self.udp_received_bytes = 0
+        self.udp_start_time = 0.0
 
     def discover_server(self):
         """
-        Listens for a server broadcast on UDP port 13117,
-        then parses the incoming data to retrieve the server IP and TCP port.
+        Wait for the broadcast offer on port 13117.
+        Once received, parse out the server's IP & port.
         """
-        print("[Client] Listening for broadcast offers on UDP port 13117...")
-
-        # Create a UDP socket to receive broadcast
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind(('', 13117))
+        print("[Client] Client started, listening for offer requests on UDP port 13117...")
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(('', 13117))
 
         while True:
-            data, addr = sock.recvfrom(1024)  # Block until data arrives
-            if len(data) >= 7:  # Enough bytes to parse magic_cookie + message_type + port
-                # Packet format: >IBH => 4 bytes (cookie), 1 byte (type), 2 bytes (TCP port)
-                magic_cookie, message_type, server_port = struct.unpack('>IBH', data)
+            data, addr = s.recvfrom(1024)  # blocking
+            if len(data) >= 7:
+                magic_cookie, message_type, tcp_port = struct.unpack('>IBH', data)
                 if magic_cookie == 0xabcddcba and message_type == 0x2:
                     self.server_ip = addr[0]
-                    self.server_port = server_port
-                    print(f"[Client] Received offer from {self.server_ip} on TCP port {self.server_port}")
+                    self.server_port = tcp_port
+                    print(f"[Client] Received offer from {self.server_ip}, TCP port {tcp_port}")
                     break
 
-        sock.close()
+        s.close()
 
     def connect_and_run(self):
         """
-        Connects to the server via TCP, sends the file size request,
-        spawns a UDP listening thread on the same ephemeral port, and measures performance.
+        1) Connect to the server via TCP
+        2) Bind a UDP socket to the same ephemeral port
+        3) Request the file (TCP)
+        4) Receive the file (TCP)
+        5) Listen for the UDP transfer
         """
         if not self.server_ip or not self.server_port:
-            print("[Client] No server information. Call discover_server() first.")
+            print("[Client] No server info. Please run discover_server() first.")
             return
 
-        # 1) Create TCP socket
+        print(f"[Client] Attempting to connect to server at {self.server_ip}:{self.server_port} ...")
         tcp_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        tcp_socket.bind(('', 0))  # Let OS pick ephemeral port
-
-        # 2) Connect to the server
+        tcp_socket.bind(('', 0))  # ephemeral port
         tcp_socket.connect((self.server_ip, self.server_port))
-        local_ip, local_tcp_port = tcp_socket.getsockname()
-        print(f"[Client] Connected to server at {self.server_ip}:{self.server_port}")
-        print(f"[Client] Local ephemeral TCP port: {local_tcp_port}")
 
-        # 3) Create a UDP socket bound to the same port
+        local_ip, local_port = tcp_socket.getsockname()
+        print(f"[Client] Connected to {self.server_ip}:{self.server_port} from local port {local_port}")
+
+        # Create a UDP socket on the same port
         self.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.udp_socket.bind(('', local_tcp_port))
+        self.udp_socket.bind(('', local_port))
 
-        # Start thread to listen for UDP data
+        # Start listening thread for UDP packets
         self.keep_listening = True
-        self.udp_listen_thread = threading.Thread(target=self.listen_udp, daemon=True)
+        self.udp_listen_thread = threading.Thread(target=self.listen_for_udp, daemon=True)
         self.udp_listen_thread.start()
 
-        # 4) Send the file size request (e.g., "FileSize:2048") over TCP
-        request_str = f"FileSize:{self.file_size}"
-        tcp_socket.sendall(request_str.encode())
-        print(f"[Client] Sent file size request: {request_str}")
+        # TCP transfer
+        self.send_file_size_request(tcp_socket)
+        self.receive_tcp_data(tcp_socket)
 
-        # 5) Receive file data over TCP
+        # Wait a moment for UDP to finish
+        time.sleep(2)
+        self.stop_udp()
+
+    def send_file_size_request(self, tcp_socket):
+        """
+        Send the request to the server in the form "FileSize:<N>"
+        """
+        msg = f"FileSize:{self.file_size}"
+        tcp_socket.sendall(msg.encode())
+        print(f"[Client] Sent file size request: {msg}")
+
+    def receive_tcp_data(self, tcp_socket):
+        """
+        Receive 'self.file_size' bytes of data via TCP, measure time & print stats.
+        """
         start_time = time.time()
-        bytes_received = 0
+
+        total_received = 0
         buffer = b''
 
-        while bytes_received < self.file_size:
+        while total_received < self.file_size:
             data = tcp_socket.recv(4096)
             if not data:
                 break
             buffer += data
-            bytes_received = len(buffer)
+            total_received = len(buffer)
 
         end_time = time.time()
         tcp_socket.close()
 
-        # Compute TCP stats
-        tcp_duration = max(end_time - start_time, 1e-6)
-        tcp_throughput = bytes_received / tcp_duration  # bytes/s
+        duration = max(end_time - start_time, 1e-6)
+        speed_bps = total_received / duration
 
-        print(f"\n[Client] TCP Transfer complete!")
-        print(f"         Requested/Received: {self.file_size}/{bytes_received} bytes")
-        print(f"         Duration: {tcp_duration:.3f} sec")
-        print(f"         Throughput: {tcp_throughput:.2f} bytes/s")
+        print(f"[Client] TCP transfer #1 finished, total time: {duration:.3f} seconds, "
+              f"total speed: {speed_bps:.2f} bytes/second")
 
-        # 6) Give the server some time to send UDP packets
-        time.sleep(2)
-
-        # Stop UDP listening
-        self.keep_listening = False
-        if self.udp_socket:
-            self.udp_socket.close()
-        if self.udp_listen_thread:
-            self.udp_listen_thread.join()
-
-        # Print UDP stats
-        print(f"\n[Client] UDP Transfer stats:")
-        print(f"         Total packets received: {self.udp_segments_received}")
-        print(f"         Total UDP bytes received: {self.udp_received_bytes}")
-
-    def listen_udp(self):
+    def listen_for_udp(self):
         """
-        Continuously receives UDP packets on our ephemeral TCP port.
-        For each packet, increments counters for total packets and bytes.
+        Continuously receive UDP packets from the server to measure stats.
+        We'll parse the header (magic cookie, msg type, total segs, current seg),
+        then read the payload data. We'll track how many segments arrive.
         """
+        self.udp_start_time = time.time()
         print(f"[Client] Listening for UDP data on port {self.udp_socket.getsockname()[1]}...")
 
         while self.keep_listening:
@@ -129,14 +134,33 @@ class SpeedTestClient:
                 if data:
                     self.udp_segments_received += 1
                     self.udp_received_bytes += len(data)
-            except socket.error:
-                # Socket likely closed
+            except:
                 break
 
+    def stop_udp(self):
+        """
+        Stop the UDP listening thread & print stats.
+        """
+        self.keep_listening = False
+        if self.udp_socket:
+            self.udp_socket.close()
+        if self.udp_listen_thread:
+            self.udp_listen_thread.join()
+
+        end_time = time.time()
+        total_time = max(end_time - self.udp_start_time, 1e-6)
+        speed_bps = self.udp_received_bytes / total_time
+
+        print(f"[Client] UDP transfer #1 finished, total time: {total_time:.3f} seconds, "
+              f"total speed: {speed_bps:.2f} bytes/second")
+        # If you wanted to compute packet loss, you'd parse segment headers & compare.
+
 def main():
-    client = SpeedTestClient(file_size=2048)  # or any file size you want
+    client = SpeedTestClient(file_size=2048)  # Adjust the requested size as you wish
     client.discover_server()
     client.connect_and_run()
+
+    print("[Client] All transfers complete, listening for offer requests...")
 
 if __name__ == "__main__":
     main()
