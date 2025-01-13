@@ -3,7 +3,6 @@ import threading
 import struct
 import time
 from socket import *
-from scapy.arch import get_if_addr
 
 
 class SpeedTestServer:
