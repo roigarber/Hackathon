@@ -30,7 +30,7 @@ class SpeedTestClient:
         self.num_udp = 1       # Number of UDP connections
 
         # Server details
-        self.server_ip = None          # The IP address of the server
+        self.server_ip = "192.168.56.1"          # The IP address of the server
         self.server_udp_port = None    # The UDP port of the server
         self.server_tcp_port = None    # The TCP port of the server
 
