@@ -97,35 +97,37 @@ class SpeedTestClient:
         finally:
             s.close()
 
-    def run_speed_test(self):
-        """
-        According to the user parameters:
-         1) Run self.num_tcp TCP connections
-         2) Run self.num_udp UDP connections
-        Each connection is handled in its own thread to support parallelism.
-        """
-        tcp_threads = []
-        udp_threads = []
+   def run_speed_test(self):
+    """
+    According to the user parameters:
+     1) Run self.num_tcp TCP connections
+     2) Run self.num_udp UDP connections
+    Interleaves TCP and UDP connections to simulate real-world network usage.
+    Each connection is handled in its own thread to support parallelism.
+    """
+    threads = []
+    total_connections = max(self.num_tcp, self.num_udp)
 
-        print(f"{YELLOW}[Client] Starting TCP transfers...{RESET}")
-        for i in range(self.num_tcp):
+    for i in range(total_connections):
+        # Start a TCP transfer if there are remaining TCP connections to start
+        if i < self.num_tcp:
             print(f"{YELLOW}[Client] Preparing TCP transfer #{i + 1}...{RESET}")
-            thread = threading.Thread(target=self.run_tcp_transfer, args=(i + 1,))
-            tcp_threads.append(thread)
-            thread.start()
+            tcp_thread = threading.Thread(target=self.run_tcp_transfer, args=(i + 1,))
+            threads.append(tcp_thread)
+            tcp_thread.start()
 
-        print(f"{YELLOW}[Client] Starting UDP transfers...{RESET}")
-        for i in range(self.num_udp):
+        # Start a UDP transfer if there are remaining UDP connections to start
+        if i < self.num_udp:
             print(f"{YELLOW}[Client] Preparing UDP transfer #{i + 1}...{RESET}")
-            thread = threading.Thread(target=self.run_udp_transfer, args=(i + 1,))
-            udp_threads.append(thread)
-            thread.start()
+            udp_thread = threading.Thread(target=self.run_udp_transfer, args=(i + 1,))
+            threads.append(udp_thread)
+            udp_thread.start()
 
-        # Wait for all threads to complete
-        for thread in tcp_threads + udp_threads:
-            thread.join()
+    # Wait for all threads to complete
+    for thread in threads:
+        thread.join()
 
-        print(f"{GREEN}[Client] All transfers complete.{RESET}")
+    print(f"{GREEN}[Client] All transfers complete.{RESET}")
 
     def run_tcp_transfer(self, index):
         """
