@@ -97,7 +97,7 @@ class SpeedTestClient:
         finally:
             s.close()
 
-def run_speed_test(self):
+    def run_speed_test(self):
         """
         According to the user parameters:
          1) Run self.num_tcp TCP connections
@@ -126,8 +126,6 @@ def run_speed_test(self):
             thread.join()
 
         print(f"{GREEN}[Client] All transfers complete.{RESET}")
-
-
 
     def run_tcp_transfer(self, index):
         """
