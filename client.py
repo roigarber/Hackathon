@@ -70,7 +70,7 @@ class SpeedTestClient:
         """
         print(f"{YELLOW}[Client] Listening for offer on UDP port 13117...{RESET}")
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1) #SO_REUSEADDR
         s.bind(('', 13117))
         s.settimeout(5)  # Timeout for waiting on the offer packet
 
@@ -83,6 +83,8 @@ class SpeedTestClient:
                     magic_cookie, msg_type, udp_port, tcp_port = struct.unpack('>IBHH', data)
                     if magic_cookie == MAGIC_COOKIE and msg_type == MSG_TYPE_OFFER:
                         self.server_ip = addr[0]
+                        #self.server_ip = '192.168.131.148'
+                        #print(self.server_ip)
                         self.server_udp_port = udp_port
                         self.server_tcp_port = tcp_port
                         print(f"{GREEN}[Client] Offer received from {self.server_ip} "
