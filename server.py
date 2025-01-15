@@ -71,11 +71,11 @@ class SpeedTestServer:
         """
 
         # 1) Bind to UDP server port (for receiving 0x3 request packets)
-        self.udp_server_socket.bind(('', self.server_udp_port))
+        self.udp_server_socket.bind(('0.0.0.0', self.server_udp_port))
         threading.Thread(target=self.udp_request_listener, daemon=True).start()
 
         # 2) Bind + listen on TCP
-        self.tcp_server_socket.bind(('', self.server_tcp_port))
+        self.tcp_server_socket.bind(('0.0.0.0', self.server_tcp_port))
         self.tcp_server_socket.listen(5)  # allow up to 5 pending connections
         threading.Thread(target=self.tcp_connection_listener, daemon=True).start()
 
