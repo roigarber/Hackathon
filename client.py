@@ -9,6 +9,7 @@ MSG_TYPE_OFFER = 0x2
 MSG_TYPE_REQUEST = 0x3
 MSG_TYPE_PAYLOAD = 0x4
 
+
 class SpeedTestClient:
     def __init__(self):
         """
@@ -16,8 +17,7 @@ class SpeedTestClient:
           - Prompts for file size, #TCP connections, #UDP connections
           - Listens for an Offer packet (0x2) on port 13117
           - Once found, extracts server_udp_port and server_tcp_port
-          - For each TCP connection: connects, sends file size, receives that many bytes
-          - For each UDP connection: sends a Request packet (0x3) to server_udp_port, receives payload packets (0x4)
+          - Handles multiple TCP and UDP connections simultaneously using threads.
         """
         self.file_size = None
         self.num_tcp = 1
@@ -28,21 +28,12 @@ class SpeedTestClient:
         self.server_udp_port = None
         self.server_tcp_port = None
 
-        # UDP data tracking
-        self.udp_socket = None
-        self.keep_receiving = True
-        self.received_segments = set()  # We'll track which segment numbers arrived
-        self.total_segments = 0
-        self.udp_bytes_received = 0
-        self.udp_start_time = 0.0
-
     def startup_prompt(self):
         """
         Prompts the user to input:
           1) file_size
           2) num_tcp
           3) num_udp
-        Similar to the example run instructions.
         """
         print("[Client] Enter file size in bytes: ", end="", flush=True)
         self.file_size = int(input().strip())
@@ -63,43 +54,49 @@ class SpeedTestClient:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.bind(('', 13117))
+        s.settimeout(5)  # Set a 5-second timeout
 
-       s.settimeout(5)  # Set a 5-second timeout
-
-try:
-    while True:
-        data, addr = s.recvfrom(1024)  # Blocking with a timeout
-        if len(data) >= 7:
-            magic_cookie, message_type, tcp_port = struct.unpack('>IBH', data)
-            if magic_cookie == 0xabcddcba and message_type == 0x2:
-                self.server_ip = addr[0]
-                self.server_port = tcp_port
-                print(f"[Client] Received offer from {self.server_ip}, TCP port {tcp_port}")
-                break
-except socket.timeout:
-    print("[Client] Timeout: No offer received.")
-finally:
-    s.close()
-
+        try:
+            while True:
+                data, addr = s.recvfrom(1024)  # Blocking with a timeout
+                if len(data) >= 9:
+                    magic_cookie, message_type, udp_port, tcp_port = struct.unpack('>IBHH', data)
+                    if magic_cookie == MAGIC_COOKIE and message_type == MSG_TYPE_OFFER:
+                        self.server_ip = addr[0]
+                        self.server_udp_port = udp_port
+                        self.server_tcp_port = tcp_port
+                        print(f"[Client] Received offer from {self.server_ip}, UDP port {udp_port}, TCP port {tcp_port}")
+                        break
+        except socket.timeout:
+            print("[Client] Timeout: No offer received.")
+        finally:
+            s.close()
 
     def run_speed_test(self):
         """
-        According to the user parameters:
-         1) run self.num_tcp TCP connections
-         2) run self.num_udp UDP connections
-        We do them sequentially here for simplicity (the example run references threads, but this is enough to demonstrate).
+        Run the specified number of TCP and UDP connections:
+          - Each connection runs in its own thread for parallel execution.
         """
-        for i in range(self.num_tcp):
-            self.run_tcp_transfer(i + 1)
+        threads = []
 
+        # Start TCP connections
+        for i in range(self.num_tcp):
+            thread = threading.Thread(target=self.run_tcp_transfer, args=(i + 1,))
+            threads.append(thread)
+            thread.start()
+
+        # Start UDP connections
         for i in range(self.num_udp):
-            self.run_udp_transfer(i + 1)
+            thread = threading.Thread(target=self.run_udp_transfer, args=(i + 1,))
+            threads.append(thread)
+            thread.start()
+
+        # Wait for all threads to complete
+        for thread in threads:
+            thread.join()
 
         print("[Client] All transfers complete, listening for offer requests...")
 
-    # ---------------------------
-    # TCP logic
-    # ---------------------------
     def run_tcp_transfer(self, index):
         """
         1) Connect to server_tcp_port
@@ -111,21 +108,19 @@ finally:
         tcp_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         tcp_socket.connect((self.server_ip, self.server_tcp_port))
 
-        # Send the file size + newline (the assignment says: "client sends the amount of data requested, then newline")
+        # Send the file size + newline
         request_str = f"{self.file_size}\n"
         tcp_socket.sendall(request_str.encode())
 
         # Receive data
         start_time = time.time()
         bytes_received = 0
-        buffer = b''
 
         while bytes_received < self.file_size:
             chunk = tcp_socket.recv(4096)
             if not chunk:
                 break
-            buffer += chunk
-            bytes_received = len(buffer)
+            bytes_received += len(chunk)
 
         end_time = time.time()
         tcp_socket.close()
@@ -136,111 +131,42 @@ finally:
         print(f"[Client] TCP transfer #{index} finished, total time: {duration:.3f} seconds, "
               f"total speed: {speed_bps:.2f} bits/second")
 
-    # ---------------------------
-    # UDP logic
-    # ---------------------------
     def run_udp_transfer(self, index):
         """
-        1) Create a local UDP socket.
-        2) Send the "request" packet: 
-             [cookie=0xabcddcba, type=0x3, file_size=8 bytes]
-        3) Listen for "payload" (0x4) packets in a separate thread
-           until no data arrives for ~1 second.
-        4) Compute throughput, packet success, etc.
+        1) Send a request packet to server_udp_port
+        2) Listen for payload packets for ~2 seconds
+        3) Compute throughput, packet success, etc.
         """
         print(f"[Client] Starting UDP transfer #{index} with file_size={self.file_size}...")
+        udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
-        # Create the UDP socket for this transfer
-        self.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.udp_socket.bind(('', 0))  # ephemeral port
-
-        # Reset our stats
-        self.keep_receiving = True
-        self.udp_start_time = time.time()
-        self.received_segments = set()
-        self.total_segments = 0
-        self.udp_bytes_received = 0
-
-        # Start a receive thread
-        recv_thread = threading.Thread(target=self.udp_receive_loop, daemon=True)
-        recv_thread.start()
-
-        # Construct the request packet:
-        # Format: >IBQ => 4 bytes (cookie), 1 byte (type=0x3), 8 bytes (file size)
+        # Construct the request packet
         packet = struct.pack('>IBQ', MAGIC_COOKIE, MSG_TYPE_REQUEST, self.file_size)
+        udp_socket.sendto(packet, (self.server_ip, self.server_udp_port))
 
-        # Send it to the server's UDP port
-        self.udp_socket.sendto(packet, (self.server_ip, self.server_udp_port))
+        start_time = time.time()
+        bytes_received = 0
 
-        # Wait a bit (the assignment says "the client detects the transfer is done after no data for 1 second")
-        # We'll do a simple "wait 2s then stop" approach for demonstration.
-        time.sleep(2)
-
-        # Stop receiving
-        self.keep_receiving = False
-        self.udp_socket.close()
-        recv_thread.join()
-
-        # Now compute stats
-        end_time = time.time()
-        duration = max(end_time - self.udp_start_time, 1e-9)
-        speed_bps = (self.udp_bytes_received * 8) / duration
-
-        # If we never got any payload, total_segments=0
-        if self.total_segments == 0:
-            success_percent = 0.0
-        else:
-            success_percent = 100.0 * len(self.received_segments) / self.total_segments
-
-        print(f"[Client] UDP transfer #{index} finished, total time: {duration:.3f} seconds, "
-              f"total speed: {speed_bps:.2f} bits/second, "
-              f"percentage of packets received successfully: {success_percent:.1f}%")
-
-    def udp_receive_loop(self):
-        """
-        Receives packets of type=0x4:
-          [cookie=0xabcddcba, type=0x4, total_segments=8 bytes, current_segment=8 bytes, payload...]
-        We'll parse the header (first 21 bytes) and keep track of which segments have arrived.
-        Also track total received bytes for throughput calculations.
-        """
-        self.udp_socket.settimeout(0.5)  # 500ms to avoid blocking forever
-        last_received_time = time.time()
-
-        while self.keep_receiving:
+        while time.time() - start_time < 2:  # Listen for 2 seconds
             try:
-                data, addr = self.udp_socket.recvfrom(65535)
+                data, addr = udp_socket.recvfrom(65535)
                 if data:
-                    last_received_time = time.time()
-                    self.udp_bytes_received += len(data)
-
-                    # The minimal header size: 21 bytes => 4 + 1 + 8 + 8
-                    if len(data) >= 21:
-                        cookie, msg_type, tot_seg, cur_seg = struct.unpack('>IBQQ', data[:21])
-                        # Verify it's a valid payload
-                        if cookie == MAGIC_COOKIE and msg_type == MSG_TYPE_PAYLOAD:
-                            self.total_segments = tot_seg
-                            self.received_segments.add(cur_seg)
-
+                    bytes_received += len(data)
             except socket.timeout:
-                # If no data for 0.5s, check if 1s has passed since last data
-                # The assignment example says "concludes after no data has been received for 1 second"
-                if (time.time() - last_received_time) > 1.0:
-                    # We'll consider this done
-                    break
-            except:
-                # Socket closed or other error
                 break
 
+        udp_socket.close()
+
+        duration = max(time.time() - start_time, 1e-9)
+        speed_bps = (bytes_received * 8) / duration  # bits/sec
+
+        print(f"[Client] UDP transfer #{index} finished, total time: {duration:.3f} seconds, "
+              f"total speed: {speed_bps:.2f} bits/second")
+
 def main():
-    # 1) Prompt user for file size, #TCP, #UDP
     client = SpeedTestClient()
     client.startup_prompt()
-
-    # 2) Listen for the server's offer (0x2)
     client.listen_for_offer()
-
-    # 3) Run the requested speed tests (TCP & UDP)
     client.run_speed_test()
 
 if __name__ == "__main__":
