@@ -64,19 +64,23 @@ class SpeedTestClient:
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.bind(('', 13117))
 
-        while True:
-            data, addr = s.recvfrom(1024)
-            if len(data) >= 9:
-                cookie, msg_type, srv_udp_port, srv_tcp_port = struct.unpack('>IBHH', data)
-                if cookie == MAGIC_COOKIE and msg_type == MSG_TYPE_OFFER:
-                    self.server_ip = addr[0]  # the IP of the server
-                    self.server_udp_port = srv_udp_port
-                    self.server_tcp_port = srv_tcp_port
-                    print(f"[Client] Received offer from {self.server_ip} | "
-                          f"UDP port={srv_udp_port}, TCP port={srv_tcp_port}")
-                    break
+       s.settimeout(5)  # Set a 5-second timeout
 
-        s.close()
+try:
+    while True:
+        data, addr = s.recvfrom(1024)  # Blocking with a timeout
+        if len(data) >= 7:
+            magic_cookie, message_type, tcp_port = struct.unpack('>IBH', data)
+            if magic_cookie == 0xabcddcba and message_type == 0x2:
+                self.server_ip = addr[0]
+                self.server_port = tcp_port
+                print(f"[Client] Received offer from {self.server_ip}, TCP port {tcp_port}")
+                break
+except socket.timeout:
+    print("[Client] Timeout: No offer received.")
+finally:
+    s.close()
+
 
     def run_speed_test(self):
         """
