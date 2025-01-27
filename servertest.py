@@ -21,8 +21,9 @@ MSG_REQUEST     = 0x3   # Request message type
 MSG_PAYLOAD     = 0x4   # Payload message type
 
 SERVER_HOST     = "0.0.0.0"  # Listen on all interfaces
-SERVER_UDP_PORT = 15000      # Chosen UDP port
-SERVER_TCP_PORT = 15001      # Chosen TCP port
+SERVER_UDP_PORT = 20001
+SERVER_TCP_PORT = 20002
+      # Chosen TCP port
 
 BROADCAST_DELAY = 1.0        # Seconds between sending UDP offers
 CHUNK_SIZE      = 1024       # Send data in 1KB chunks for both TCP and UDP
