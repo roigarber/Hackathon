@@ -1,249 +1,345 @@
-import socket
+from socket import *
 import struct
 import time
 import threading
-import sys
+from Error_handler import ErrorHandler
 
-# --------------------------------------------------------------------------------------
-# Color codes (optional)
-# --------------------------------------------------------------------------------------
-COL_RESET  = "\033[0m"
-COL_BLUE   = "\033[94m"
-COL_RED    = "\033[91m"
-COL_GREEN  = "\033[92m"
-COL_YELLOW = "\033[93m"
-
-# --------------------------------------------------------------------------------------
-# Constants
-# --------------------------------------------------------------------------------------
-MAGIC_COOKIE    = 0xabcddcba
-MSG_OFFER       = 0x2
-MSG_REQUEST     = 0x3
-MSG_PAYLOAD     = 0x4
-
-UDP_LISTEN_PORT = 15000   # The same port on which server broadcasts offers
-BROADCAST_WAIT  = 10      # Seconds to wait for a broadcast
-CHUNK_SIZE      = 1024    # 1KB chunk, used in reading TCP data
-EPSILON         = 1e-9    # Avoid division by zero
-
-# --------------------------------------------------------------------------------------
-# Logging helpers
-# --------------------------------------------------------------------------------------
-
-def log_info(msg):
-    print(f"{COL_GREEN}[INFO]{COL_RESET} {msg}")
-
-def log_warning(msg):
-    print(f"{COL_YELLOW}[WARN]{COL_RESET} {msg}")
-
-def log_error(msg):
-    print(f"{COL_RED}[ERROR]{COL_RESET} {msg}")
-
-# --------------------------------------------------------------------------------------
-# Broadcast Reception (Client Side)
-# --------------------------------------------------------------------------------------
-
-def wait_for_offer(timeout_sec=BROADCAST_WAIT):
+# ------------------------------------------------------------------------------
+# Local replacement for the external StatisticsHandler
+# ------------------------------------------------------------------------------
+class StatisticsHandler:
     """
-    Opens a UDP socket to listen for an 'offer' broadcast from any server.
-    Returns (server_ip, server_udp_port, server_tcp_port) if successful, otherwise None.
+    A local replacement for the external StatisticsHandler module.
+    Stores TCP/UDP results and writes them to a CSV file.
     """
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    def __init__(self):
+        self.tcp_results = []
+        self.udp_results = []
+
+    def add_tcp_result(self, connection_number, file_size, elapsed_time, speed):
+        """
+        Stores a single TCP result.
+        """
+        self.tcp_results.append({
+            'connection_number': connection_number,
+            'file_size': file_size,
+            'elapsed_time': elapsed_time,
+            'speed': speed
+        })
+
+    def add_udp_result(self, connection_number, file_size, elapsed_time, speed, success_rate, lost_packets):
+        """
+        Stores a single UDP result.
+        """
+        self.udp_results.append({
+            'connection_number': connection_number,
+            'file_size': file_size,
+            'elapsed_time': elapsed_time,
+            'speed': speed,
+            'success_rate': success_rate,
+            'lost_packets': lost_packets
+        })
+
+    def save_statistics_to_csv(self, filename='statistics.csv'):
+        """
+        Saves both TCP and UDP results to a CSV file.
+        """
+        import csv
+        with open(filename, mode='w', newline='') as csvfile:
+            writer = csv.writer(csvfile)
+            # Write a header for TCP results
+            writer.writerow(["TCP_Connection", "File_Size", "Elapsed_Time_s", "Speed_bps"])
+            for result in self.tcp_results:
+                writer.writerow([
+                    result['connection_number'],
+                    result['file_size'],
+                    f"{result['elapsed_time']:.6f}",
+                    f"{result['speed']:.6f}"
+                ])
+            # Write a separator line
+            writer.writerow([])
+            # Write a header for UDP results
+            writer.writerow(["UDP_Connection", "File_Size", "Elapsed_Time_s", "Speed_bps", "Success_Rate_%", "Lost_Packets"])
+            for result in self.udp_results:
+                writer.writerow([
+                    result['connection_number'],
+                    result['file_size'],
+                    f"{result['elapsed_time']:.6f}",
+                    f"{result['speed']:.6f}",
+                    f"{result['success_rate']:.2f}",
+                    result['lost_packets'] if result['lost_packets'] is not None else "N/A"
+                ])
+
+# ------------------------------------------------------------------------------
+# Error Handler and Colors
+# ------------------------------------------------------------------------------
+error_handler = ErrorHandler()
+
+GREEN = "\033[0;32m"
+RED = "\033[0;31m"
+YELLOW = "\033[1;33m"
+
+# ------------------------------------------------------------------------------
+# Instantiate the statistics handler
+# ------------------------------------------------------------------------------
+stats = StatisticsHandler()
+
+# ------------------------------------------------------------------------------
+# Configuration
+# ------------------------------------------------------------------------------
+magic_cookie = 0xabcddcba
+serverUDPPort = 12000
+broadcast_timeout = 10  # Time to listen for broadcast (in seconds)
+epsilon = 1e-8  # Small value to prevent division by zero
+
+
+def is_valid_port(port):
+    """
+    Check if the given port is within the valid range (1024–65535).
+
+    Args:
+        port (int): The port number to validate.
+
+    Returns:
+        bool: True if the port is valid, False otherwise.
+    """
+    return 1024 <= port <= 65535
+
+
+def receive_broadcast():
+    """
+    Listen for the server's broadcast message.
+
+    Opens a UDP socket to listen for broadcast messages from the server. If a valid
+    broadcast message is received, it extracts the UDP and TCP ports and validates them.
+
+    Returns:
+        tuple: A tuple containing the server IP, UDP port, and TCP port if successful.
+               Otherwise, returns (None, None, None).
+    """
+    clientSocket = socket(AF_INET, SOCK_DGRAM)
+    clientSocket.setsockopt(SOL_SOCKET, SO_BROADCAST, 1)
+    clientSocket.bind(('', serverUDPPort))
+    clientSocket.settimeout(broadcast_timeout)
     try:
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        s.bind(("", UDP_LISTEN_PORT))  # Listen on all interfaces for incoming broadcast
-        s.settimeout(timeout_sec)
+        message, serverAddress = clientSocket.recvfrom(2048)
+        header = struct.unpack('!IBHH', message)
+        if header[0] == magic_cookie and header[1] == 0x2:
+            udp_port = header[2]
+            tcp_port = header[3]
 
-        data, addr = s.recvfrom(1024)  # Blocks until data arrives or times out
-        if len(data) < 8:
-            return None
-
-        # Packet format: magic_cookie (4 bytes), msg_type (1 byte), udpPort (2 bytes), tcpPort (2 bytes)
-        raw_cookie, raw_type, srv_udp, srv_tcp = struct.unpack("!IBHH", data)
-        if raw_cookie == MAGIC_COOKIE and raw_type == MSG_OFFER:
-            return addr[0], srv_udp, srv_tcp
-
-    except socket.timeout:
-        log_warning("No offer received within the timeout period.")
+            # Validate the ports
+            if not is_valid_port(udp_port) or not is_valid_port(tcp_port):
+                error_handler.handle_error(
+                    f"\n{RED}Invalid ports received: UDP Port {udp_port}, TCP Port {tcp_port}.{RED}"
+                )
+            print(f"Offer received from {serverAddress[0]}: UDP Port {udp_port}, TCP Port {tcp_port}")
+            return serverAddress[0], udp_port, tcp_port
+    except timeout as e:
+        error_handler.handle_error(f"\n{RED}No broadcast received within the timeout period.{RED}", e)
+    except struct.error as e:
+        error_handler.handle_error(f"\n{RED}Error decoding broadcast message.{RED}", e)
     except Exception as e:
-        log_error(f"Error while waiting for offer: {e}")
+        error_handler.handle_error(f"\n{RED}Unexpected error during broadcast reception.{RED}", e)
     finally:
-        s.close()
-    return None
+        clientSocket.close()
+    return None, None, None
 
-# --------------------------------------------------------------------------------------
-# TCP Transfer
-# --------------------------------------------------------------------------------------
 
-def do_tcp_transfer(server_ip, tcp_port, size_bytes, index, result_list):
+def tcp_transfer(serverIP, tcpPort, file_size, connection_number, num_connections, results):
     """
-    Connects to the server on the given TCP port, requests 'size_bytes' data,
-    times how long it takes to receive it, and appends (description, time, speed)
-    to result_list.
-    """
-    start_time = time.time()
-    received   = 0
+    Run a single TCP transfer.
 
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    Connects to the server using a TCP socket and requests a specific segment of the file.
+    Measures the transfer time and calculates the transfer speed.
+
+    Args:
+        serverIP (str): The server's IP address.
+        tcpPort (int): The server's TCP port.
+        file_size (int): The total file size to be transferred.
+        connection_number (int): The identifier for the current connection.
+        num_connections (int): The total number of TCP connections.
+        results (list): A shared list to store the results of the transfer.
+    """
+    clientSocket = socket(AF_INET, SOCK_STREAM)
     try:
-        sock.connect((server_ip, tcp_port))
+        clientSocket.connect((serverIP, tcpPort))
+        segment_file_size = file_size
+        start_time = time.time()
 
-        # Send ASCII request: the file size plus newline
-        sock.sendall(str(size_bytes).encode() + b"\n")
+        # Send request
+        clientSocket.sendall(str(segment_file_size).encode('utf-8'))
 
-        while received < size_bytes:
-            chunk = sock.recv(CHUNK_SIZE)
+        # Receive data
+        received_bytes = 0
+        while received_bytes < segment_file_size:
+            chunk = clientSocket.recv(1024)
             if not chunk:
                 break
-            received += len(chunk)
+            received_bytes += len(chunk)
 
-        elapsed = time.time() - start_time
-        bit_rate = (size_bytes * 8.0) / max(elapsed, EPSILON)
-        result_list.append((f"TCP #{index}", elapsed, bit_rate))
+        # Calculate transfer summary
+        end_time = time.time()
+        elapsed_time = end_time - start_time
+        speed = (segment_file_size * 8) / (elapsed_time + epsilon)  # Speed in bits per second
+        results.append((f"TCP transfer #{connection_number}", elapsed_time, speed))
 
+        # Record the result in stats
+        stats.add_tcp_result(connection_number, segment_file_size, elapsed_time, speed)
+
+    except ConnectionError as e:
+        error_handler.handle_error(f"\n{RED}TCP connection #{connection_number} error.{RED}", e)
     except Exception as e:
-        log_error(f"TCP transfer #{index} error: {e}")
+        error_handler.handle_error(f"\n{RED}Unexpected error in TCP transfer #{connection_number}.{RED}", e)
     finally:
-        sock.close()
+        clientSocket.close()
 
-# --------------------------------------------------------------------------------------
-# UDP Transfer
-# --------------------------------------------------------------------------------------
 
-def do_udp_transfer(server_ip, udp_port, size_bytes, index, result_list):
+def udp_transfer(serverIP, udpPort, file_size, connection_number, num_connections, results):
     """
-    Sends a UDP request to the server for 'size_bytes' of data, then receives
-    payload packets until no more arrive (1-second timeout).
-    Appends (description, time, speed, success_pct) to result_list.
+    Run a single UDP transfer.
+
+    Sends a request to the server over UDP for a specific segment of the file.
+    Receives data packets and calculates transfer metrics like speed and packet success rate.
+
+    Args:
+        serverIP (str): The server's IP address.
+        udpPort (int): The server's UDP port.
+        file_size (int): The total file size to be transferred.
+        connection_number (int): The identifier for the current connection.
+        num_connections (int): The total number of UDP connections.
+        results (list): A shared list to store the results of the transfer.
     """
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.settimeout(1.0)  # 1-second timeout for receiving data
-    start_time = time.time()
+    clientSocket = socket(AF_INET, SOCK_DGRAM)
+    clientSocket.settimeout(1)
 
-    # Pack: magic_cookie (4 bytes), msg_type (1 byte), file_size (8 bytes)
-    request_msg = struct.pack("!IBQ", MAGIC_COOKIE, MSG_REQUEST, size_bytes)
-    s.sendto(request_msg, (server_ip, udp_port))
+    try:
+        segment_file_size = file_size
+        start_time = time.time()
 
-    total_segments   = 0
-    received_segments = 0
+        # Send request
+        request_message = struct.pack('!IBQ', magic_cookie, 0x3, segment_file_size)
+        clientSocket.sendto(request_message, (serverIP, udpPort))
 
-    # Keep reading until we time out or we detect we're done
-    while True:
-        try:
-            data, _ = s.recvfrom(4096)
-            if len(data) < 20:
-                continue
+        # Receive data
+        received_segments = 0
+        total_segments = None
 
-            # The payload header is: magic_cookie (4 bytes), msg_type (1 byte),
-            #                        total_segments (8 bytes), current_segment (8 bytes)
-            header = struct.unpack("!IBQQ", data[:21])  # 21 because 4+1+8+8 = 21 bytes
-            if header[0] != MAGIC_COOKIE or header[1] != MSG_PAYLOAD:
-                continue
+        while True:
+            try:
+                packet, _ = clientSocket.recvfrom(2048)
+                # Minimum length check (magic cookie, type, segment count, segment number)
+                if len(packet) < 21:
+                    continue
 
-            total_segments = header[2]
-            seq_number     = header[3]
+                header = struct.unpack('!IBQQ', packet[:21])
+                if header[0] != magic_cookie or header[1] != 0x4:
+                    continue
 
-            received_segments += 1
+                total_segments = header[2]
+                received_segments += 1
 
-            # If we've received the last segment, break
-            if received_segments == total_segments:
+                if received_segments == total_segments:
+                    break
+            except timeout:
                 break
 
-        except socket.timeout:
-            # No more packets arrived within timeout
-            break
-        except Exception as e:
-            log_error(f"UDP transfer error #{index}: {e}")
-            break
+        # Calculate transfer summary
+        end_time = time.time()
+        elapsed_time = end_time - start_time
+        speed = (segment_file_size * 8) / (elapsed_time + epsilon)  # bits per second
+        packet_success_rate = (received_segments / total_segments) * 100 if total_segments else 0
+        success_rate = (received_segments / total_segments) * 100 if total_segments else 0
+        lost_packets = total_segments - received_segments if total_segments else None
 
-    elapsed      = time.time() - start_time
-    bit_rate     = (size_bytes * 8.0) / max(elapsed, EPSILON)
-    success_rate = 0.0
-    if total_segments > 0:
-        success_rate = (received_segments / total_segments) * 100.0
+        # Record results
+        results.append((f"UDP transfer #{connection_number}", elapsed_time, speed, packet_success_rate))
+        stats.add_udp_result(connection_number, segment_file_size, elapsed_time, speed, success_rate, lost_packets)
 
-    result_list.append((f"UDP #{index}", elapsed, bit_rate, success_rate))
-    s.close()
+    except Exception as e:
+        error_handler.handle_error(f"\n{RED}Error in UDP transfer #{connection_number}.{RED}", e)
+    finally:
+        clientSocket.close()
 
-# --------------------------------------------------------------------------------------
-# Main Client Flow
-# --------------------------------------------------------------------------------------
 
 def main():
-    while True:
-        try:
-            log_info("Waiting for an offer...")
-            srv_info = wait_for_offer()
-            if not srv_info:
-                log_warning("No server found. Retrying...\n")
-                continue
+    """
+    Main function to coordinate the client workflow.
 
-            server_ip, udp_port, tcp_port = srv_info
-            log_info(f"Received offer from {server_ip}: UDP={udp_port}, TCP={tcp_port}")
-
-            # Prompt the user for parameters
+    Steps:
+    1. Receive broadcast from the server to obtain connection details.
+    2. Prompt the user for file size and the number of connections.
+    3. Perform TCP and UDP transfers using threads.
+    4. Display transfer results and save statistics.
+    """
+    try:
+        while True:
             try:
-                file_size_str = input(f"{COL_BLUE}Enter file size in bytes: {COL_RESET}").strip()
-                file_size     = int(file_size_str)
+                # Step 1: Receive broadcast
+                serverIP, udpPort, tcpPort = receive_broadcast()
+                if not serverIP:
+                    print(f"{RED}No server found. Exiting.{RED}")
+                    continue
 
-                tcp_count_str = input(f"{COL_BLUE}Enter number of TCP connections: {COL_RESET}").strip()
-                tcp_count     = int(tcp_count_str)
+                # Step 2: Enter test parameters
+                try:
+                    file_size = int(input(f"{YELLOW}Enter file size to request (in bytes): {YELLOW}").strip())
+                    num_tcp_connections = int(input(f"{YELLOW}Enter number of TCP connections: {YELLOW}").strip())
+                    num_udp_connections = int(input(f"{YELLOW}Enter number of UDP connections: {YELLOW}").strip())
+                except ValueError as e:
+                    error_handler.handle_error(f"\nEntered wrong parameters", e)
+                    continue
 
-                udp_count_str = input(f"{COL_BLUE}Enter number of UDP connections: {COL_RESET}").strip()
-                udp_count     = int(udp_count_str)
-            except ValueError:
-                log_error("Invalid integer input. Please try again.")
-                continue
+                # Step 3: Run tests using threads
+                threads = []
+                results = []
 
-            # Launch threads for transfers
-            results = []
-            threads = []
+                # Start TCP connections
+                for i in range(num_tcp_connections):
+                    thread = threading.Thread(
+                        target=tcp_transfer,
+                        args=(serverIP, tcpPort, file_size, i + 1, num_tcp_connections, results)
+                    )
+                    threads.append(thread)
+                    thread.start()
 
-            # Start the TCP connections
-            for i in range(1, tcp_count + 1):
-                t = threading.Thread(
-                    target=do_tcp_transfer,
-                    args=(server_ip, tcp_port, file_size, i, results),
-                    daemon=True
-                )
-                t.start()
-                threads.append(t)
+                # Start UDP connections
+                for i in range(num_udp_connections):
+                    thread = threading.Thread(
+                        target=udp_transfer,
+                        args=(serverIP, udpPort, file_size, i + 1, num_udp_connections, results)
+                    )
+                    threads.append(thread)
+                    thread.start()
 
-            # Start the UDP connections
-            for i in range(1, udp_count + 1):
-                t = threading.Thread(
-                    target=do_udp_transfer,
-                    args=(server_ip, udp_port, file_size, i, results),
-                    daemon=True
-                )
-                t.start()
-                threads.append(t)
+                # Wait for all threads to complete
+                for thread in threads:
+                    thread.join()
 
-            # Wait for all threads
-            for t in threads:
-                t.join()
+                # Step 4: Display results
+                for result in results:
+                    if "TCP" in result[0]:
+                        print(f"{YELLOW}{result[0]} finished, total time: "
+                              f"{GREEN}{result[1]:.2f}{GREEN} seconds, "
+                              f"total speed: {GREEN}{result[2]:.2f}{GREEN} bits/second.{YELLOW}")
+                    elif "UDP" in result[0]:
+                        print(f"{YELLOW}{result[0]} finished, total time: "
+                              f"{GREEN}{result[1]:.2f}{GREEN} seconds, "
+                              f"total speed: {GREEN}{result[2]:.2f}{GREEN} bits/second, "
+                              f"percentage of packets received successfully: "
+                              f"{GREEN}{result[3]:.2f}%{GREEN}.{YELLOW}")
 
-            # Summarize
-            for entry in results:
-                if entry[0].startswith("TCP"):
-                    _, t_elapsed, t_bitrate = entry
-                    print(f"{COL_YELLOW}{entry[0]} finished{COL_RESET}, "
-                          f"time: {t_elapsed:.2f}s, speed: {t_bitrate:.2f} bps")
-                else:
-                    _, u_elapsed, u_bitrate, u_success = entry
-                    print(f"{COL_YELLOW}{entry[0]} finished{COL_RESET}, "
-                          f"time: {u_elapsed:.2f}s, speed: {u_bitrate:.2f} bps, "
-                          f"packets received: {u_success:.1f}%")
+                print(f"{GREEN}All transfers complete, listening to offer requests{GREEN}")
+                stats.save_statistics_to_csv()
+                print(f"{GREEN}Statistics saved to CSV file.{GREEN}")
 
-            print(f"{COL_GREEN}All transfers complete. Returning to wait for offers...{COL_RESET}\n")
+            except Exception as e:
+                error_handler.handle_error("An unexpected error occurred in the main workflow.", e)
 
-        except KeyboardInterrupt:
-            log_warning("Client terminated by user.")
-            sys.exit(0)
-        except Exception as e:
-            log_error(f"Unexpected error in client main loop: {e}")
-            # Continue listening or break? Here we just keep going.
-            continue
+    except KeyboardInterrupt:
+        print(f"\n{RED}KeyboardInterrupt detected. Exiting{RED}")
+        error_handler.handle_error("Program terminated by user (KeyboardInterrupt).")
+
 
 if __name__ == "__main__":
     main()
