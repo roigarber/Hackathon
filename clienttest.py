@@ -4,13 +4,13 @@ import socket
 import struct
 import threading
 import time
+import math
 
 logging.basicConfig(
     level=logging.DEBUG,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
-
 
 # ANSI color codes for enhanced output readability
 class Colors:
@@ -24,19 +24,21 @@ class Colors:
     BOLD = '\033[1m'
     UNDERLINE = '\033[4m'
 
-
 # Constants
 MAGIC_COOKIE = 0xabcddcba
 OFFER_MESSAGE_TYPE = 0x2
 REQUEST_MESSAGE_TYPE = 0x3
 PAYLOAD_MESSAGE_TYPE = 0x4
 OFFER_LISTEN_PORT = 13117
-BUFFER_SIZE = 1024
+# Increase BUFFER_SIZE to accommodate larger UDP packets.
+BUFFER_SIZE = 8192
 UDP_TIMEOUT = 1.0
 COOLDOWN_PERIOD = 5
 
-print_lock = threading.Lock()
+# Increase UDP_PAYLOAD_SIZE to match the server (4096 bytes)
+UDP_PAYLOAD_SIZE = 4096
 
+print_lock = threading.Lock()
 
 def colored_print(message, color=Colors.ENDC):
     """
@@ -45,18 +47,14 @@ def colored_print(message, color=Colors.ENDC):
     with print_lock:
         print(f"{color}{message}{Colors.ENDC}")
 
-
 def get_user_parameters():
     """
-    Prompts the user for parameters.
-    Returns a tuple: (file_size, num_tcp, num_udp).
-   
-    Note: For TCP, file_size is interpreted as a number of bytes;
-          for UDP, file_size will be interpreted as the number of UDP packets.
+    Gets user parameters.
+    Returns a tuple of (file_size, num_tcp, num_udp).
     """
     while True:
         try:
-            file_size_input = input("Enter the file size to download (in bytes for TCP / number of UDP packets for UDP): ")
+            file_size_input = input("Enter the file size to download (in bytes): ")
             file_size = int(file_size_input)
             if file_size <= 0:
                 raise ValueError("File size must be positive.")
@@ -74,7 +72,6 @@ def get_user_parameters():
             return file_size, num_tcp, num_udp
         except ValueError as ve:
             colored_print(f"Invalid input: {ve}. Please try again.", Colors.WARNING)
-
 
 def perform_tcp_transfer(server_ip, server_tcp_port, file_size, transfer_id):
     """
@@ -103,70 +100,57 @@ def perform_tcp_transfer(server_ip, server_tcp_port, file_size, transfer_id):
     except Exception as e:
         colored_print(f"TCP transfer #{transfer_id} failed: {e}", Colors.FAIL)
 
-
 def perform_udp_transfer(server_ip, server_udp_port, file_size, transfer_id, stats_lock, stats):
     """
     Performs a UDP transfer to the specified server.
     Measures transfer time, speed, and packet loss percentage.
     Logs the results.
-   
-    In this version, the file_size value represents the expected number of UDP packets.
-    Each packet from the server is expected to have a 21-byte header with the format: '!IBQQ'
-    (i.e. 4 bytes for magic cookie, 1 byte for message type, 8 bytes for total_segments,
-     and 8 bytes for current_segment).
     """
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp_sock:
             udp_sock.settimeout(UDP_TIMEOUT)
-           
-            # Send request message to server
             request_message = struct.pack('!IBQ', MAGIC_COOKIE, REQUEST_MESSAGE_TYPE, file_size)
             start_time = time.time()
             udp_sock.sendto(request_message, (server_ip, server_udp_port))
-           
-            expected_segments = file_size  # Expecting 'file_size' number of UDP packets
-            received_segments = 0
+            total_received_bytes = 0
+            packets_received = 0
+            # Calculate expected number of packets based on UDP_PAYLOAD_SIZE
+            expected_packets = file_size // UDP_PAYLOAD_SIZE
+            if file_size % UDP_PAYLOAD_SIZE != 0:
+                expected_packets += 1
             last_receive_time = time.time()
-           
-            while True:
+            while total_received_bytes < file_size:
                 try:
-                    data, addr = udp_sock.recvfrom(1024)
+                    data, addr = udp_sock.recvfrom(BUFFER_SIZE)
                     current_time = time.time()
-                   
-                    if len(data) < 21:
-                        continue  # not correct payload length
-                   
-                    # Unpack the header: 4 bytes (magic cookie), 1 byte (message type),
-                    # 8 bytes (total segments), 8 bytes (current segment)
-                    magic_cookie, message_type, total_segments, current_segment = struct.unpack('!IBQQ', data[:21])
-                    if magic_cookie != MAGIC_COOKIE or message_type != PAYLOAD_MESSAGE_TYPE:
-                        continue  # invalid payload
-                   
-                    received_segments += 1
+                    if len(data) < 9:
+                        continue  # The header is 9 bytes long
+                    header = data[:9]
+                    payload = data[9:]
+                    magic_cookie_recv, message_type_recv, data_size = struct.unpack('!IBI', header)
+                    if magic_cookie_recv != MAGIC_COOKIE or message_type_recv != PAYLOAD_MESSAGE_TYPE:
+                        continue
+                    packets_received += 1
+                    total_received_bytes += len(payload)
                     last_receive_time = current_time
-                   
                 except socket.timeout:
                     if time.time() - last_receive_time >= UDP_TIMEOUT:
                         break
-           
             end_time = time.time()
             duration = end_time - start_time
-            speed = (received_segments * 8) / duration  # bits per second
-            packet_loss = ((expected_segments - received_segments) / expected_segments * 100) if expected_segments > 0 else 0
-           
+            speed = (total_received_bytes * 8) / duration  # bits per second
+            received_percentage = (packets_received / expected_packets) * 100 if expected_packets > 0 else 0
             colored_print(
                 f"UDP transfer #{transfer_id} finished, total time: {duration:.2f} seconds, total speed: {speed:.2f} bits/second, "
-                f"percentage of packets received successfully: {100 - packet_loss:.2f}%",
+                f"percentage of packets received successfully: {received_percentage:.2f}%",
                 Colors.OKCYAN)
-           
             with stats_lock:
                 stats['udp_total_time'] += duration
                 stats['udp_total_speed'] += speed
-                stats['udp_total_packets'] += expected_segments
-                stats['udp_received_packets'] += received_segments
+                stats['udp_total_bytes'] += file_size
+                stats['udp_received_bytes'] += total_received_bytes
     except Exception as e:
         colored_print(f"UDP transfer #{transfer_id} failed: {e}", Colors.FAIL)
-
 
 def start_speed_test(server_info, file_size, num_tcp, num_udp):
     """
@@ -178,11 +162,10 @@ def start_speed_test(server_info, file_size, num_tcp, num_udp):
     stats = {
         'udp_total_time': 0.0,
         'udp_total_speed': 0.0,
-        'udp_total_packets': 0,
-        'udp_received_packets': 0
+        'udp_total_bytes': 0,
+        'udp_received_bytes': 0
     }
     stats_lock = threading.Lock()
-   
     # Start TCP transfers
     for i in range(1, num_tcp + 1):
         tcp_thread = threading.Thread(
@@ -192,7 +175,6 @@ def start_speed_test(server_info, file_size, num_tcp, num_udp):
         )
         threads.append(tcp_thread)
         tcp_thread.start()
-   
     # Start UDP transfers
     for i in range(1, num_udp + 1):
         udp_thread = threading.Thread(
@@ -202,20 +184,17 @@ def start_speed_test(server_info, file_size, num_tcp, num_udp):
         )
         threads.append(udp_thread)
         udp_thread.start()
-   
     for thread in threads:
         thread.join()
-   
     if num_udp > 0:
         avg_udp_time = stats['udp_total_time'] / num_udp
         avg_udp_speed = stats['udp_total_speed'] / num_udp
-        total_expected = stats['udp_total_packets']
-        total_received = stats['udp_received_packets']
-        loss_percent = ((total_expected - total_received) / total_expected * 100) if total_expected > 0 else 0
+        total_requested = stats['udp_total_bytes']
+        total_received = stats['udp_received_bytes']
+        loss_percent = ((total_requested - total_received) / total_requested * 100) if total_requested > 0 else 0
         colored_print(f"Average UDP transfer time: {avg_udp_time:.2f} seconds", Colors.OKCYAN)
         colored_print(f"Average UDP transfer speed: {avg_udp_speed:.2f} bits/second", Colors.OKCYAN)
-        colored_print(f"Total UDP packet loss: {loss_percent:.2f}%", Colors.OKCYAN)
-
+        colored_print(f"Total UDP data loss: {loss_percent:.2f}%", Colors.OKCYAN)
 
 def listen_for_offers(stop_event, offer_queue):
     """
@@ -237,13 +216,12 @@ def listen_for_offers(stop_event, offer_queue):
             except Exception as e:
                 colored_print(f"Error in offer listener: {e}", Colors.FAIL)
 
-
 def main():
     """
     Main function for the client:
     1. Starts the offer listener.
     2. Loops forever:
-       a. Asks the user to enter the file size and connection counts.
+       a. Asks the user to enter the file size (and connection counts).
        b. Waits for an offer from a server.
        c. Launches the speed test.
        d. Prints “All transfers complete, listening to offer requests”
@@ -257,19 +235,16 @@ def main():
         daemon=True
     )
     offer_listener_thread.start()
-   
     while True:
         file_size, num_tcp, num_udp = get_user_parameters()
         colored_print("Waiting for an offer...", Colors.OKBLUE)
-        server_info = offer_queue.get()  # Blocking until an offer arrives
-       
+        server_info = offer_queue.get()  # Blocking call until an offer arrives
         # Clear any extra pending offers
         while not offer_queue.empty():
             try:
                 offer_queue.get_nowait()
             except queue.Empty:
                 break
-       
         start_speed_test(server_info, file_size, num_tcp, num_udp)
         colored_print("All transfers complete, listening to offer requests", Colors.OKBLUE)
         # Loop back to ask for user parameters again.
