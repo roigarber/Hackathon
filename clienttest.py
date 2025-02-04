@@ -103,8 +103,10 @@ def perform_tcp_transfer(server_ip, server_tcp_port, file_size, transfer_id):
 def perform_udp_transfer(server_ip, server_udp_port, file_size, transfer_id, stats_lock, stats):
     """
     Performs a UDP transfer to the specified server.
-    Measures transfer time, speed, and packet loss percentage.
-    Logs the results.
+    Now the file_size is interpreted as the total number of bytes to receive.
+    The client receives packets (each with a 9-byte header plus payload),
+    counts the number of packets received, and stops when the total bytes received
+    reaches or exceeds the requested file size.
     """
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp_sock:
@@ -114,7 +116,7 @@ def perform_udp_transfer(server_ip, server_udp_port, file_size, transfer_id, sta
             udp_sock.sendto(request_message, (server_ip, server_udp_port))
             total_received_bytes = 0
             packets_received = 0
-            # Calculate expected number of packets based on UDP_PAYLOAD_SIZE
+            # Calculate expected number of packets
             expected_packets = file_size // UDP_PAYLOAD_SIZE
             if file_size % UDP_PAYLOAD_SIZE != 0:
                 expected_packets += 1
