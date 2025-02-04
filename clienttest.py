@@ -2,7 +2,6 @@ from socket import *
 import struct
 import time
 import threading
-from Error_handler import ErrorHandler
 
 # ------------------------------------------------------------------------------
 # Local replacement for the external StatisticsHandler
@@ -71,10 +70,19 @@ class StatisticsHandler:
                 ])
 
 # ------------------------------------------------------------------------------
-# Error Handler and Colors
+# LOCAL ERROR HANDLER FUNCTION (replaces external ErrorHandler)
 # ------------------------------------------------------------------------------
-error_handler = ErrorHandler()
+def handle_error(message, exception=None):
+    """
+    Prints an error message and optional exception details.
+    """
+    print(message)
+    if exception is not None:
+        print(f"Exception details: {exception}")
 
+# ------------------------------------------------------------------------------
+# Colors
+# ------------------------------------------------------------------------------
 GREEN = "\033[0;32m"
 RED = "\033[0;31m"
 YELLOW = "\033[1;33m"
@@ -92,7 +100,6 @@ serverUDPPort = 12000
 broadcast_timeout = 10  # Time to listen for broadcast (in seconds)
 epsilon = 1e-8  # Small value to prevent division by zero
 
-
 def is_valid_port(port):
     """
     Check if the given port is within the valid range (1024–65535).
@@ -104,7 +111,6 @@ def is_valid_port(port):
         bool: True if the port is valid, False otherwise.
     """
     return 1024 <= port <= 65535
-
 
 def receive_broadcast():
     """
@@ -121,6 +127,7 @@ def receive_broadcast():
     clientSocket.setsockopt(SOL_SOCKET, SO_BROADCAST, 1)
     clientSocket.bind(('', serverUDPPort))
     clientSocket.settimeout(broadcast_timeout)
+
     try:
         message, serverAddress = clientSocket.recvfrom(2048)
         header = struct.unpack('!IBHH', message)
@@ -130,21 +137,20 @@ def receive_broadcast():
 
             # Validate the ports
             if not is_valid_port(udp_port) or not is_valid_port(tcp_port):
-                error_handler.handle_error(
-                    f"\n{RED}Invalid ports received: UDP Port {udp_port}, TCP Port {tcp_port}.{RED}"
-                )
+                handle_error(f"\n{RED}Invalid ports received: UDP Port {udp_port}, TCP Port {tcp_port}.{RED}")
             print(f"Offer received from {serverAddress[0]}: UDP Port {udp_port}, TCP Port {tcp_port}")
             return serverAddress[0], udp_port, tcp_port
+
     except timeout as e:
-        error_handler.handle_error(f"\n{RED}No broadcast received within the timeout period.{RED}", e)
+        handle_error(f"\n{RED}No broadcast received within the timeout period.{RED}", e)
     except struct.error as e:
-        error_handler.handle_error(f"\n{RED}Error decoding broadcast message.{RED}", e)
+        handle_error(f"\n{RED}Error decoding broadcast message.{RED}", e)
     except Exception as e:
-        error_handler.handle_error(f"\n{RED}Unexpected error during broadcast reception.{RED}", e)
+        handle_error(f"\n{RED}Unexpected error during broadcast reception.{RED}", e)
     finally:
         clientSocket.close()
-    return None, None, None
 
+    return None, None, None
 
 def tcp_transfer(serverIP, tcpPort, file_size, connection_number, num_connections, results):
     """
@@ -152,14 +158,6 @@ def tcp_transfer(serverIP, tcpPort, file_size, connection_number, num_connection
 
     Connects to the server using a TCP socket and requests a specific segment of the file.
     Measures the transfer time and calculates the transfer speed.
-
-    Args:
-        serverIP (str): The server's IP address.
-        tcpPort (int): The server's TCP port.
-        file_size (int): The total file size to be transferred.
-        connection_number (int): The identifier for the current connection.
-        num_connections (int): The total number of TCP connections.
-        results (list): A shared list to store the results of the transfer.
     """
     clientSocket = socket(AF_INET, SOCK_STREAM)
     try:
@@ -188,12 +186,11 @@ def tcp_transfer(serverIP, tcpPort, file_size, connection_number, num_connection
         stats.add_tcp_result(connection_number, segment_file_size, elapsed_time, speed)
 
     except ConnectionError as e:
-        error_handler.handle_error(f"\n{RED}TCP connection #{connection_number} error.{RED}", e)
+        handle_error(f"\n{RED}TCP connection #{connection_number} error.{RED}", e)
     except Exception as e:
-        error_handler.handle_error(f"\n{RED}Unexpected error in TCP transfer #{connection_number}.{RED}", e)
+        handle_error(f"\n{RED}Unexpected error in TCP transfer #{connection_number}.{RED}", e)
     finally:
         clientSocket.close()
-
 
 def udp_transfer(serverIP, udpPort, file_size, connection_number, num_connections, results):
     """
@@ -201,14 +198,6 @@ def udp_transfer(serverIP, udpPort, file_size, connection_number, num_connection
 
     Sends a request to the server over UDP for a specific segment of the file.
     Receives data packets and calculates transfer metrics like speed and packet success rate.
-
-    Args:
-        serverIP (str): The server's IP address.
-        udpPort (int): The server's UDP port.
-        file_size (int): The total file size to be transferred.
-        connection_number (int): The identifier for the current connection.
-        num_connections (int): The total number of UDP connections.
-        results (list): A shared list to store the results of the transfer.
     """
     clientSocket = socket(AF_INET, SOCK_DGRAM)
     clientSocket.settimeout(1)
@@ -228,7 +217,7 @@ def udp_transfer(serverIP, udpPort, file_size, connection_number, num_connection
         while True:
             try:
                 packet, _ = clientSocket.recvfrom(2048)
-                # Minimum length check (magic cookie, type, segment count, segment number)
+                # Minimum length check for (magic cookie, type, segment count, segment number)
                 if len(packet) < 21:
                     continue
 
@@ -242,6 +231,7 @@ def udp_transfer(serverIP, udpPort, file_size, connection_number, num_connection
                 if received_segments == total_segments:
                     break
             except timeout:
+                # Timed out waiting for more packets
                 break
 
         # Calculate transfer summary
@@ -257,10 +247,9 @@ def udp_transfer(serverIP, udpPort, file_size, connection_number, num_connection
         stats.add_udp_result(connection_number, segment_file_size, elapsed_time, speed, success_rate, lost_packets)
 
     except Exception as e:
-        error_handler.handle_error(f"\n{RED}Error in UDP transfer #{connection_number}.{RED}", e)
+        handle_error(f"\n{RED}Error in UDP transfer #{connection_number}.{RED}", e)
     finally:
         clientSocket.close()
-
 
 def main():
     """
@@ -287,7 +276,7 @@ def main():
                     num_tcp_connections = int(input(f"{YELLOW}Enter number of TCP connections: {YELLOW}").strip())
                     num_udp_connections = int(input(f"{YELLOW}Enter number of UDP connections: {YELLOW}").strip())
                 except ValueError as e:
-                    error_handler.handle_error(f"\nEntered wrong parameters", e)
+                    handle_error(f"\nEntered wrong parameters", e)
                     continue
 
                 # Step 3: Run tests using threads
@@ -334,12 +323,10 @@ def main():
                 print(f"{GREEN}Statistics saved to CSV file.{GREEN}")
 
             except Exception as e:
-                error_handler.handle_error("An unexpected error occurred in the main workflow.", e)
-
+                handle_error("An unexpected error occurred in the main workflow.", e)
     except KeyboardInterrupt:
         print(f"\n{RED}KeyboardInterrupt detected. Exiting{RED}")
-        error_handler.handle_error("Program terminated by user (KeyboardInterrupt).")
-
+        handle_error("Program terminated by user (KeyboardInterrupt).")
 
 if __name__ == "__main__":
     main()
