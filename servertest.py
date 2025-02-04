@@ -1,171 +1,187 @@
 import socket
 import struct
+import threading
 import time
-from threading import Thread
 
-# Color constants for printing
-GREEN = "\033[0;32m"
-RED = "\033[0;31m"
-YELLOW = "\033[1;33m"
+# constants
+MAGIC_COOKIE = 0xabcddcba
+OFFER_MESSAGE_TYPE = 0x2
+REQUEST_MESSAGE_TYPE = 0x3
+PAYLOAD_MESSAGE_TYPE = 0x4
 
-# Server configuration
-serverIP = '192.168.155.103'   # Replace with your server machine's IP
-serverUDPPort = 12000
-serverTCPPort = 12345
-magic_cookie = 0xabcddcba
+print_lock = threading.Lock()
 
-def handle_error(message, exception):
+UDP_PORT = 13117
+TCP_PORT = 12000
+
+# Increase UDP_PAYLOAD_SIZE to 4096 bytes to reduce the number of packets.
+UDP_PAYLOAD_SIZE = 4096
+
+def get_server_ip():
     """
-    A local error-handling function to log/display an error message
-    alongside the exception details (mimicking the original ErrorHandler).
-    """
-    print(message)
-    print(f"Exception details: {exception}")
-
-try:
-    # Create and bind UDP socket
-    udpSocket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    udpSocket.bind((serverIP, serverUDPPort))
-    # Increase the UDP socket's send buffer size
-    udpSocket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024 * 1024)
-
-    # Create and bind TCP socket
-    tcpSocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    tcpSocket.bind((serverIP, serverTCPPort))
-    tcpSocket.listen(5)
-
-    print(f"{GREEN}Server started, listening on IP address {serverIP}{GREEN}")
-except Exception as e:
-    handle_error(f"{RED}Error initializing server sockets{RED}", e)
-    exit(1)
-
-def send_offer():
-    """
-    Sends periodic offer messages via UDP broadcast.
-
-    Description:
-        This function broadcasts a structured offer message over UDP to all
-        clients on the network. The offer contains a magic cookie, message type,
-        and the server's UDP/TCP port numbers. It runs continuously, sending
-        the broadcast every 1 second.
+    Retrieves the server's IP address for establishing connections.
     """
     try:
-        offer_message = struct.pack('!IBHH', magic_cookie, 0x2, serverUDPPort, serverTCPPort)
-        broadcast_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        broadcast_socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        broadcast_address = '255.255.255.255'
-        while True:
-            broadcast_socket.sendto(offer_message, (broadcast_address, serverUDPPort))
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(('8.8.8.8', 80))
+            return s.getsockname()[0]
+    except Exception:
+        return '127.0.0.1'
+
+def send_offer_messages(server_udp_port, server_tcp_port, stop_event):
+    """
+    Continuously sends UDP offer messages until stop_event is set.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP) as offer_socket:
+        offer_socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        offer_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        broadcast_address = ('<broadcast>', 13117)
+        while not stop_event.is_set():
+            try:
+                offer_message = struct.pack('!IBHH', MAGIC_COOKIE, OFFER_MESSAGE_TYPE, server_udp_port, server_tcp_port)
+                offer_socket.sendto(offer_message, broadcast_address)
+            except Exception:
+                pass
             time.sleep(1)
-    except Exception as e:
-        handle_error(f"{RED}Error in send_offer, couldn't send the offer{RED}", e)
 
-def handle_single_udp_request(message, clientAddress):
+def handle_tcp_client(conn, addr):
     """
-    Processes a single UDP request from a client.
+    Manages a TCP client connection: receives the file size, sends that many bytes, and closes.
+    """
+    with conn:
+        try:
+            data = b''
+            while not data.endswith(b'\n'):
+                chunk = conn.recv(1024)
+                if not chunk:
+                    break
+                data += chunk
+            if not data:
+                return
+            try:
+                file_size_str = data.decode().strip()
+                file_size = int(file_size_str)
+                if file_size < 0:
+                    raise ValueError("Negative file size")
+            except ValueError:
+                return
+            bytes_sent = 0
+            chunk_size = 1024
+            while bytes_sent < file_size:
+                remaining = file_size - bytes_sent
+                send_size = min(chunk_size, remaining)
+                conn.sendall(b'\0' * send_size)
+                bytes_sent += send_size
+        except Exception:
+            pass
 
-    Description:
-        Validates the incoming request by checking its size and magic cookie.
-        Extracts the requested file size and sends the data back to the client
-        in 1KB chunks. Each chunk includes a payload header (magic cookie, type,
-        segment count, segment number) followed by the data.
+def tcp_server(server_tcp_port, stop_event):
+    """
+    Sets up the TCP server to accept incoming connections.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as tcp_sock:
+        tcp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        tcp_sock.bind(('', server_tcp_port))
+        tcp_sock.listen()
+        tcp_sock.settimeout(1.0)
+        while not stop_event.is_set():
+            try:
+                conn, addr = tcp_sock.accept()
+                client_thread = threading.Thread(target=handle_tcp_client, args=(conn, addr), daemon=True)
+                client_thread.start()
+            except socket.timeout:
+                continue
+            except Exception:
+                pass
+
+def handle_udp_request(request_data, client_address, server_udp_socket):
+    """
+    Processes a UDP request sent by a client.
+    Now treats the file size as the total number of bytes to send.
+    It divides the total bytes into chunks of size UDP_PAYLOAD_SIZE.
     """
     try:
-        # Expected size for '!IBQ' is 13 bytes
-        if len(message) != 13:
+        if len(request_data) != 13:  # 4 (magic cookie) + 1 (type) + 8 (file_size)
             return
-
-        header = struct.unpack('!IBQ', message)
-        if header[0] != magic_cookie or header[1] != 0x3:
-            print(f"\n{YELLOW}Ignoring invalid message from {clientAddress}. "
-                  f"Incorrect magic cookie or type.{YELLOW}")
+        magic_cookie, message_type, file_size = struct.unpack('!IBQ', request_data)
+        if magic_cookie != MAGIC_COOKIE or message_type != REQUEST_MESSAGE_TYPE:
             return
+        total_bytes = file_size
+        total_segments = total_bytes // UDP_PAYLOAD_SIZE
+        remainder = total_bytes % UDP_PAYLOAD_SIZE
+        if remainder > 0:
+            total_segments += 1
+        for segment in range(total_segments):
+            if segment == total_segments - 1 and remainder > 0:
+                data_size = remainder
+            else:
+                data_size = UDP_PAYLOAD_SIZE
+            # Header: 4 bytes (magic cookie), 1 byte (message type), 4 bytes (data_size)
+            header = struct.pack('!IBI', MAGIC_COOKIE, PAYLOAD_MESSAGE_TYPE, data_size)
+            payload = b'\0' * data_size
+            packet = header + payload
+            server_udp_socket.sendto(packet, client_address)
+    except Exception:
+        pass
 
-        file_size = header[2]
-        print(f"\n{YELLOW}UDP client {clientAddress} requested {file_size} bytes.{YELLOW}")
-
-        # Calculate how many 1KB segments we need
-        segment_count = file_size // 1024 + (1 if file_size % 1024 else 0)
-        for segment_number in range(segment_count):
-            payload_header = struct.pack('!IBQQ', magic_cookie, 0x4, segment_count, segment_number)
-            payload_data = b'a' * min(1024, file_size - segment_number * 1024)
-            udpSocket.sendto(payload_header + payload_data, clientAddress)
-
-        print(f"\n{GREEN}Completed UDP transfer to {clientAddress}{GREEN}")
-
-    except Exception as e:
-        handle_error(f"\n{RED}Error handling UDP request from {clientAddress}{RED}", e)
-
-def handle_udp_requests():
+def udp_server(server_udp_port, stop_event):
     """
-    Continuously listens for incoming UDP messages and spawns a thread
-    to handle each request.
+    Listens for UDP requests and processes them.
     """
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp_sock:
+        udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        udp_sock.bind(('', server_udp_port))
+        udp_sock.settimeout(1.0)
+        while not stop_event.is_set():
+            try:
+                data, addr = udp_sock.recvfrom(UDP_PAYLOAD_SIZE + 50)  # Extra space for header
+                request_thread = threading.Thread(target=handle_udp_request, args=(data, addr, udp_sock), daemon=True)
+                request_thread.start()
+            except socket.timeout:
+                continue
+            except Exception:
+                pass
+
+def main():
+    """
+    Main function to start the server:
+    - Retrieves dynamic UDP/TCP ports.
+    - Starts threads for sending offers, handling TCP connections, and processing UDP requests.
+    - Runs indefinitely until interrupted.
+    """
+    server_ip = get_server_ip()
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as temp_udp_sock:
+        temp_udp_sock.bind(('', 0))
+        server_udp_port = temp_udp_sock.getsockname()[1]
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as temp_tcp_sock:
+        temp_tcp_sock.bind(('', 0))
+        server_tcp_port = temp_tcp_sock.getsockname()[1]
+    stop_event = threading.Event()
     try:
+        offer_thread = threading.Thread(target=send_offer_messages, args=(server_udp_port, server_tcp_port, stop_event), daemon=True)
+        offer_thread.start()
+        tcp_thread = threading.Thread(target=tcp_server, args=(server_tcp_port, stop_event), daemon=True)
+        tcp_thread.start()
+        udp_thread = threading.Thread(target=udp_server, args=(server_udp_port, stop_event), daemon=True)
+        udp_thread.start()
+        with print_lock:
+            print(f"Server started, listening on IP address {server_ip}")
+            print(f"UDP Port: {server_udp_port}, TCP Port: {server_tcp_port}")
         while True:
-            message, clientAddress = udpSocket.recvfrom(2048)
-            Thread(target=handle_single_udp_request, args=(message, clientAddress), daemon=True).start()
+            time.sleep(1)
+    except KeyboardInterrupt:
+        with print_lock:
+            print("\nShutting down the server...")
+        stop_event.set()
+        offer_thread.join()
+        tcp_thread.join()
+        udp_thread.join()
+        with print_lock:
+            print("Server successfully shut down.")
     except Exception as e:
-        handle_error(f"{RED}Error in handle_udp_requests{RED}", e)
+        with print_lock:
+            print(f"Server encountered an error: {e}")
+        stop_event.set()
 
-def handle_client(client_socket, client_address):
-    """
-    Handles a single TCP client request.
-
-    Description:
-        Receives the requested file size from the client, then sends that
-        amount of data back to the client in 1KB chunks. Closes the connection
-        once the requested number of bytes has been sent.
-    """
-    try:
-        file_size_request = client_socket.recv(1024).decode('utf-8').strip()
-        if not file_size_request:
-            print(f"\n{YELLOW}No file size received from {client_address}{YELLOW}")
-            client_socket.close()
-            return
-
-        file_size = int(file_size_request)
-        print(f"\n{YELLOW}TCP client {client_address} requested {file_size} bytes.{YELLOW}")
-
-        bytes_sent = 0
-        chunk_size = 1024  # 1KB
-        while bytes_sent < file_size:
-            remaining = file_size - bytes_sent
-            to_send = b'x' * min(chunk_size, remaining)
-            client_socket.sendall(to_send)
-            bytes_sent += len(to_send)
-
-        print(f"\n{GREEN}Finished sending {bytes_sent} bytes to {client_address}{GREEN}")
-
-    except Exception as e:
-        handle_error(f"\n{RED}Error handling TCP request from {client_address}{RED}", e)
-    finally:
-        client_socket.close()
-
-def handle_tcp_clients():
-    """
-    Continuously accepts incoming TCP connections and spawns a thread
-    to handle each client.
-    """
-    try:
-        while True:
-            client_socket, client_address = tcpSocket.accept()
-            print(f"\n{GREEN}TCP connection established with {client_address}{GREEN}")
-            Thread(target=handle_client, args=(client_socket, client_address), daemon=True).start()
-    except Exception as e:
-        handle_error(f"{RED}Error in handle_tcp_clients{RED}", e)
-
-# Start the server threads
-Thread(target=send_offer, daemon=True).start()
-Thread(target=handle_udp_requests, daemon=True).start()
-Thread(target=handle_tcp_clients, daemon=True).start()
-
-# Keep main thread running until interrupted
-try:
-    while True:
-        time.sleep(1)
-except KeyboardInterrupt as e:
-    print(f"\n{RED}Shutting down the server.{RED}")
-    handle_error("Error in main", e)
-    udpSocket.close()
-    tcpSocket.close()
+if __name__ == "__main__":
+    main()
