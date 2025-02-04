@@ -9,7 +9,7 @@ RED = "\033[0;31m"
 YELLOW = "\033[1;33m"
 
 # Server configuration
-serverIP = '192.168.155.148'   # Replace with your server machine's IP
+serverIP = '0.0.0.0'   # Replace with your server machine's IP
 serverUDPPort = 12000
 serverTCPPort = 12345
 magic_cookie = 0xabcddcba
